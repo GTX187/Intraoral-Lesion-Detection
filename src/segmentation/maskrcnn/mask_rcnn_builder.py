@@ -329,6 +329,7 @@ class CocoDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx: int):
         row = self.rows.iloc[idx]
+
         img_path = str(row["image_path"])
         coco_path = str(row["coco_file"])
 
@@ -341,6 +342,31 @@ class CocoDataset(torch.utils.data.Dataset):
         with open(coco_path, "r") as f:
             coco = json.load(f)
 
+        print("Images:", len(coco["images"]))
+        print("Annotations:", len(coco["annotations"]))
+        print(
+            "Annotation example:",
+            coco["annotations"][0] if coco["annotations"] else "NONE",
+        )
+        if coco.get("images"):
+            img = coco["images"][0]
+            print("\nImage info:")
+            print("   id       :", img.get("id"), f"(type: {type(img.get('id'))})")
+            print("   file_name:", img.get("file_name"))
+
+        if coco.get("annotations"):
+            ann = coco["annotations"][0]
+            print("\nAnnotation info:")
+            print("   id        :", ann.get("id"))
+            print(
+                "   image_id  :",
+                ann.get("image_id"),
+                f"(type: {type(ann.get('image_id'))})",
+            )
+            print("   category_id:", ann.get("category_id"))
+            print("   area      :", ann.get("area"))
+            print("   bbox      :", ann.get("bbox"))
+            print("   segmentation length:", len(ann.get("segmentation", [[]])[0]))
         annotations = coco.get("annotations", [])
 
         # Build category_id → class_id mapping from the COCO file's categories
