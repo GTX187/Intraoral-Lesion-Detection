@@ -39,14 +39,12 @@ import json
 import sys
 import time
 import logging
-from pathlib import Path
-
+import numpy as np
 import torch
 import torch.optim as optim
 import pandas as pd
 
-_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_ROOT))
+from pathlib import Path
 
 from src.common.intraoral_logger import initialize_logger
 from utils.load_configuration import load_config
@@ -61,6 +59,16 @@ from src.segmentation.maskrcnn.mask_rcnn_builder import (
     _resolve_device,
     _collate_fn,
 )
+
+_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_ROOT))
+
+
+# Supressing noisy librariws
+logging.getLogger("PIL").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("matplotlib").setLevel(logging.WARNING)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Data loaders  (patient-wise split — fixed here, not in builder)
@@ -87,18 +95,13 @@ def build_data_loaders(
     df = pd.read_csv(csv_path, dtype=str)
     logger.info("  Total CSV rows: %d", len(df))
 
-    # Keep only annotated rows
-    df = df[df["coco_file"].notna()].copy()
-    logger.info("  Rows with coco_file: %d", len(df))
+    # # Keep only annotated rows
+    # df = df[df["coco_file"].notna()].copy()
+    # logger.info("Rows with coco_file: %d", len(df))
 
-    # Drop rows where files do not exist on disk
-    exists_mask = df.apply(
-        lambda r: Path(str(r["image_path"])).exists()
-        and Path(str(r["coco_file"])).exists(),
-        axis=1,
-    )
-    df = df[exists_mask].reset_index(drop=True)
-    logger.info("  Rows with both files on disk: %d", len(df))
+    # Drop rows where image_path or coco_file are null
+    df = df[df[["image_path", "coco_file"]].notnull().any(axis=1)].copy()
+    logger.info("Rows with image path and coco path not null: %d", len(df))
 
     if len(df) == 0:
         raise RuntimeError(
@@ -130,7 +133,13 @@ def build_data_loaders(
 
     train_df = df[df["patient_id"].isin(train_pids)].reset_index(drop=True)
     val_df = df[df["patient_id"].isin(val_pids)].reset_index(drop=True)
-
+    if set(train_df["patient_id"]) != set(val_df["patient_id"]):
+        logger.info("There is no overlap of patients ids in Train and Val datasets")
+    else:
+        logger.error("Found overlap of patient ids in Train and Val datasets")
+        raise Exception(
+            "Found overlap of patient ids in Train and Val datasets. Correct it."
+        )
     logger.info(
         "  Patient-wise split → train_patients=%d (%d rows)  "
         "val_patients=%d (%d rows)",
@@ -229,7 +238,9 @@ def train_one_epoch(
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
-
+        logger.info(
+            f" Losses for epoch: {epoch} and batch index:{batch_idx} are: {loss_dict}"
+        )
         # Accumulate for logging
         for k, v in loss_dict.items():
             total_losses[k] = total_losses.get(k, 0.0) + v.item()
@@ -239,11 +250,9 @@ def train_one_epoch(
         if (batch_idx + 1) % log_every == 0 or (batch_idx + 1) == len(loader):
             avg_total = total_losses["total"] / n_batches
             logger.info(
-                "  Epoch %d [%d/%d]  total_loss=%.4f",
-                epoch,
-                batch_idx + 1,
-                len(loader),
-                avg_total,
+                f"Epoch: {epoch} \n batch index/total rows in batch : {batch_idx + 1}/{len(loader)}"
+                f"\n total_loss={total_losses['total']} \n average loss: {avg_total}"
+                f"num of batches: {n_batches}"
             )
 
     # Average over batches
@@ -371,7 +380,7 @@ def validate_one_epoch(
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-def train(logger: logging.Logger, cfg: MaskRCNNConfig, csv_path: str) -> None:
+def train(logger: logging.Logger, config, cfg: MaskRCNNConfig, csv_path: str) -> None:
     """
     Full training pipeline:
         1. Build data loaders
@@ -507,7 +516,6 @@ def train(logger: logging.Logger, cfg: MaskRCNNConfig, csv_path: str) -> None:
 
     for epoch in range(start_epoch, n_epochs + 1):
         logger.info("\n--- Epoch %d / %d ---", epoch, n_epochs)
-
         # Train
         train_metrics = train_one_epoch(
             model,
@@ -564,6 +572,7 @@ def train(logger: logging.Logger, cfg: MaskRCNNConfig, csv_path: str) -> None:
 
         # Always save last checkpoint so training can be resumed
         all_metrics = {**train_metrics, **val_metrics}
+        logger.info(f"All metrics Before Save checkpoint: {all_metrics}")
         save_checkpoint(model, optimizer, epoch, all_metrics, last_ckpt_path, logger)
 
         # Save best checkpoint based on box mAP@50
@@ -590,10 +599,7 @@ def train(logger: logging.Logger, cfg: MaskRCNNConfig, csv_path: str) -> None:
     logger.info("Training complete. Best box_mAP50=%.4f", best_map50)
 
 
-def update_paths(config, df):
-    smart_base_path = config.get("SMART-II-DATAPATH", "smart.basepath")
-    smartom_base_path = config.get("SMART-OM-DATAPATH", "smartom.basepath")
-
+def update_merged_df_paths(smart_base_path, smartom_base_path, df):
     mask1 = df["source"] == "smart_II"
     mask2 = df["source"] == "smart_om"
     df.loc[mask1, "image_path"] = (
@@ -612,8 +618,21 @@ def update_paths(config, df):
     df.loc[mask2, "json_file"] = (
         smartom_base_path + "/" + df.loc[mask2, "json_file"].astype(str)
     )
-    df.loc[mask2, "json_file"] = (
-        smartom_base_path + "/" + df.loc[mask2, "json_file"].astype(str)
+    df.loc[mask2, "coco_file"] = (
+        smartom_base_path + "/" + df.loc[mask2, "coco_file"].astype(str)
+    )
+    return df
+
+
+def update_paths(base_path, df):
+    df["image_path"] = (
+        base_path + "/" + df["image_path"].astype(str).where(df["image_path"].notna())
+    )
+    df["json_file"] = (
+        base_path + "/" + df["json_file"].astype(str).where(df["json_file"].notna())
+    )
+    df["coco_file"] = (
+        base_path + "/" + df["coco_file"].astype(str).where(df["coco_file"].notna())
     )
     return df
 
@@ -630,71 +649,94 @@ def get_dataset_path(logger, config, cfg: MaskRCNNConfig) -> pd.DataFrame:
         take normal rows from SMART_II and SMART_OM
     """
     train_dataset_path = None
-    merged_data = config.get("SMART_MERGED", "merged.coco.output.filename")
-    augment_smart_base = config.get("AUGMENT_SMART", "augment.baseroot")
+    # Base folders
+    smart_merged_basepath = config.get("TRAIN", "smart.merged.basepath")
+    smart_base = config.get("TRAIN", "smart.basepath")
+    smartom_base = config.get("TRAIN", "smartom.basepath")
+    augment_smart_base = config.get("TRAIN", "augment.smart.baseroot")
+    augment_smartom_base = config.get("TRAIN", "augment.smartom.baseroot")
+
+    merged_data_path = f"{smart_merged_basepath}/{config.get('SMART_MERGED', 'merged.coco.output.filename')}"
     augment_smart_filename = config.get(
         "AUGMENT_SMART", "augment.patient.coco.metadata.filename"
     )
     augment_smart_data = f"{augment_smart_base}/{augment_smart_filename}"
-    augment_smartom_base = config.get("AUGMENT_SMARTOM", "augment.baseroot")
     augment_smartom_filename = config.get(
         "AUGMENT_SMARTOM", "augment.patient.coco.metadata.filename"
     )
     augment_smartom_data = f"{augment_smartom_base}/{augment_smartom_filename}"
     dataset = pd.DataFrame()
-    if Path(merged_data).exists():
-        merged_df = pd.read_csv(merged_data)
+    # Load merged_data
+    if Path(merged_data_path).exists():
+        merged_df = pd.read_csv(merged_data_path)
+        merged_df = update_merged_df_paths(
+            smart_base_path=smart_base, smartom_base_path=smartom_base, df=merged_df
+        )
         logger.info(f"Loaded Merged data, shape: {merged_df.shape}")
     else:
-        logger.error(f"Merged Dataset Not Found at path: {merged_data}")
-        raise FileNotFoundError(f"Base Dataset Not Found at Path: {merged_data}")
+        logger.error(f"Merged Dataset Not Found at path: {merged_data_path}")
+        raise FileNotFoundError(f"Merged Dataset Not Found at Path: {merged_data_path}")
 
     # Check for Smart_II Augmented Dataset
     if Path(augment_smart_data).exists():
-        dataset = pd.concat([dataset, pd.read_csv(augment_smart_data)])
+        aug_smart_df = pd.read_csv(augment_smart_data)
+        aug_smart_df = update_paths(base_path=augment_smart_base, df=aug_smart_df)
+        logger.info(f"Shape of Augmented Smart Dataset: {aug_smart_df.shape}")
+        # First update in dataset
+        dataset = pd.concat([dataset, aug_smart_df])
         logger.info(f"Added Smart_II augmented dataset: {dataset.shape}")
     else:
         logger.info("Smart_II augmented dataset not found at path {augment_smart_data}")
 
     # Check for Smart OM Augmented Dataset
     if Path(augment_smartom_data).exists():
-        dataset = pd.concat([dataset, pd.read_csv(augment_smartom_data)])
-        logger.info(f"Added Smart OM augmented dataset: {dataset.shape}")
+        aug_smartom_df = pd.read_csv(augment_smartom_data)
+        aug_smartom_df = update_paths(base_path=augment_smartom_base, df=aug_smartom_df)
+        logger.info(f"Shape of Augmented Smart_OM Dataset: {aug_smartom_df.shape}")
+        # Second update in dataset
+        dataset = pd.concat([dataset, aug_smartom_df])
+        logger.info(
+            f"Merged Smart_OM augmented and Smart_II augmented datasets. Total augmented dataset size: {dataset.shape}"
+        )
     else:
         logger.info(
             "Smart OM augmented dataset not found at path {augment_smartom_data}"
         )
     if cfg.normal_dataset == "SMART_II":
-        print("Processing for smart II dataset")
+        logger.info("Processing for smart II dataset")
         temp = merged_df[
             (merged_df.source == "smart_II")
             | ((merged_df.source == "smart_om") & ~(merged_df.label == "normal"))
         ]
-        print(f"Temp shape: {temp.shape}")
         dataset = pd.concat([dataset, temp])
-        logger.info(f"After merging Smart_II dataset shape: {dataset.shape}")
-        #  temp = merged_df[
-        #      (merged_df.source == 'smart_om') &
-        #      ~(merged_df.label == 'normal')
-        #     ]
+        logger.info(
+            f"After merging Smart_II, Smart_OM only OPMD and Variation and complete augmented dataset shape: {dataset.shape}"
+        )
     elif cfg.normal_dataset == "SMART_OM":
-        print("Processing for smart OM dataset")
+        logger.info("Processing for smart OM dataset")
         temp = merged_df[
             (merged_df.source == "smart_om")
             | ((merged_df.source == "smart_II") & ~(merged_df.label == "normal"))
         ]
-        print(f"Temp shape: {temp.shape}")
         dataset = pd.concat([dataset, temp])
-        logger.info(f"After merging Smart OM dataset shape: {dataset.shape}")
+        logger.info(
+            f"After merging Smart OM, Smart_II only OPMD and Variation and complete augmented dataset shape: {dataset.shape}"
+        )
     elif cfg.normal_dataset == "BOTH":
         dataset = pd.concat([dataset, merged_df])
         logger.info(f"After merging merged dataset shape: {dataset.shape}")
-    if dataset and not dataset.empty:
-        dataset = update_paths(config=config, df=dataset)
+
+    if dataset is not None and not dataset.empty:
         train_dataset_path = config.get("SEGMENT-MASKRCNN", "train.dataset")
-        if not Path(train_dataset_path.split("/")[:-1]).exists():
-            os.makedirs(train_dataset_path.split("/")[:-1], exist_ok=True)
-        dataset.to_csv(train_dataset_path)
+        if not Path(train_dataset_path).parent.exists():
+            os.makedirs(str(Path(train_dataset_path).parent), exist_ok=True)
+        dataset = dataset.replace([np.nan, "nan", "NaN"], None)
+        df = dataset[dataset[["image_path", "coco_file"]].notnull().all(axis=1)].copy()
+        logger.info(
+            f"Rows with image path and coco path not null in train dataset: {len(df)}"
+        )
+        logger.info(f"Rows with null coco file columns: {df.coco_file.isna().sum()}")
+        df.to_csv(train_dataset_path)
 
     return train_dataset_path
 
@@ -722,7 +764,7 @@ if __name__ == "__main__":
     maskrcnn_cfg = load_config(config.get("SEGMENT-MASKRCNN", "maskrcnn.config"))
     cfg = MaskRCNNConfig(maskrcnn_cfg)
     csv_path = get_dataset_path(logger, config, cfg)
-    train(logger=logger, cfg=cfg, csv_path=csv_path)
+    train(logger=logger, config=config, cfg=cfg, csv_path=csv_path)
 """
 mAP (mean Average Precision) is a key metric for evaluating object detection 
 and instance segmentation models like Mask R-CNN.  It measures 
