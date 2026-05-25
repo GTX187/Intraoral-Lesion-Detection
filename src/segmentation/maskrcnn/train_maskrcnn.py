@@ -49,7 +49,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
 from src.common.intraoral_logger import getLogger
-from utils.load_configuration import load_config
+from utils.load_configuration import initialize_logger
 from src.segmentation.maskrcnn.config.maskrcnnconfig import MaskRCNNConfig
 from src.segmentation.maskrcnn.mask_rcnn_builder import (
     LESION_CLASS_MAP,
