@@ -9,3 +9,4 @@ torch==2.10.0
 torchvision==0.25.0
 torchview==0.2.7
 torchinfo==1.8.0
+segmentation-models-pytorch==0.5.0
