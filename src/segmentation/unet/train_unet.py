@@ -523,11 +523,12 @@ def train(logger: logging.Logger, cfg: UNetConfig, csv_path: str) -> None:
     logger.info("=" * 60)
 
     # ── Data ──────────────────────────────────────────────────────────
-    train_loader, val_loader, num_classes = build_data_loaders(
+    train_loader, val_loader, test_loader, num_classes = build_data_loaders(
         logger=logger,
         csv_path=csv_path,
         label_class_map=LESION_CLASS_MAP,
         val_split=cfg.val_split,
+        test_split=cfg.test_split,
         batch_size=cfg.batch_size,
         num_workers=cfg.num_workers,
         seed=cfg.seed,
@@ -730,6 +731,14 @@ def train(logger: logging.Logger, cfg: UNetConfig, csv_path: str) -> None:
         model.eval()
         results = []
 
+        # val_loader has shuffle=False and batch_size=1, so enumerate(val_loader)
+        # index i lines up exactly with row i of the underlying dataset's
+        # rows DataFrame. That DataFrame still carries patient_id, image_path,
+        # and coco_file (the annotated JSON the mask was rasterised from) for
+        # every row, so we can pull the source metadata for each val sample
+        # straight from it without touching CocoSegDataset itself.
+        val_rows = val_loader.dataset.rows
+
         with torch.no_grad():
             for i, (images, masks) in enumerate(val_loader):
                 images = images.to(device)
@@ -737,6 +746,14 @@ def train(logger: logging.Logger, cfg: UNetConfig, csv_path: str) -> None:
                 logits = model(images)
                 probs = torch.sigmoid(logits.squeeze(1))
                 preds = (probs > cfg.mask_threshold).long()
+
+                row = val_rows.iloc[i]
+                patient_id = row.get("patient_id", "unknown")
+                image_path = row.get("image_path", "")
+                coco_file = row.get("coco_file", "")
+                # Sanitize for use in a filename (patient ids may contain
+                # spaces/slashes depending on the source metadata sheet).
+                safe_patient_id = str(patient_id).strip().replace("/", "_").replace(" ", "_")
 
                 # Save visualization
                 img_np = images[0].cpu().permute(1, 2, 0).numpy()
@@ -760,22 +777,58 @@ def train(logger: logging.Logger, cfg: UNetConfig, csv_path: str) -> None:
                 plt.subplot(1, 3, 3)
                 plt.imshow(overlay)
                 plt.title("Overlay (Green=Pred, Blue=GT)")
+                # patient id baked into the filename → you can eyeball the
+                # visualizations folder and immediately see whose scan it is.
+                image_filename = f"val_{i:04d}_patient-{safe_patient_id}.png"
                 plt.savefig(
-                    viz_dir / f"val_sample_{i:04d}.png", bbox_inches="tight", dpi=200
+                    viz_dir / image_filename, bbox_inches="tight", dpi=200
                 )
                 plt.close()
 
                 results.append(
                     {
                         "image_id": i,
+                        "image_file": image_filename,
+                        "patient_id": patient_id,
+                        "image_path": image_path,
+                        "coco_file": coco_file,
                         "dice": compute_metrics(preds, masks)["dice"],
                         "iou": compute_metrics(preds, masks)["iou"],
                     }
                 )
 
-        # Save summary
+        # Save summary — every row now carries the patient_id and the
+        # source COCO annotation JSON (coco_file) alongside the saved
+        # visualization filename (image_file), so val_results.csv is the
+        # single place that connects: prediction image ←→ metrics ←→
+        # patient ←→ annotated JSON used to build the ground-truth mask.
         pd.DataFrame(results).to_csv(output_dir / "val_results.csv", index=False)
         logger.info(f"✅ Validation results and visualizations saved to: {output_dir}")
+
+    # ── Optional held-out test-set evaluation ──────────────────────────
+    # Only runs if cfg.test_split > 0 produced a non-empty, patient-disjoint
+    # test_loader in build_data_loaders(). Reuses validate_one_epoch as-is —
+    # it only needs a DataLoader yielding (images, masks) batches.
+    if test_loader is not None and len(test_loader) > 0:
+        logger.info("Evaluating on held-out test set...")
+        test_metrics = validate_one_epoch(
+            model=model,
+            loader=test_loader,
+            device=device,
+            epoch=epoch,
+            logger=logger,
+            mask_threshold=cfg.mask_threshold,
+            loss_function=cfg.loss_function,
+            bce_weight=cfg.bce_weight,
+            alpha=cfg.alpha,
+            beta=cfg.beta,
+            focal_gamma=cfg.focal_gamma,
+            focal_alpha=cfg.focal_alpha,
+        )
+        test_metrics = {k.replace("val_", "test_", 1): v for k, v in test_metrics.items()}
+        logger.info("Test set metrics: %s", test_metrics)
+        with open(Path(cfg.output_dir) / "test_metrics.json", "w") as f:
+            json.dump(test_metrics, f, indent=2)
 
     # ── Save training history ─────────────────────────────────────────
     history_path = checkpoint_dir / "training_history.json"
@@ -783,6 +836,51 @@ def train(logger: logging.Logger, cfg: UNetConfig, csv_path: str) -> None:
         json.dump(history, f, indent=2)
     logger.info("Training history saved → %s", history_path)
     logger.info("Training complete. Best val_dice=%.4f", best_dice)
+
+
+def trace_patient_from_val_results(
+    output_dir: str,
+    image_id: Optional[int] = None,
+    image_file: Optional[str] = None,
+    patient_id: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    Look up the patient_id and source COCO annotation JSON for one or more
+    validation samples, using val_results.csv (written at the end of train()).
+
+    Pass exactly one of:
+        image_id    : the integer index used in the epoch loop / filename
+        image_file  : the saved visualization filename, e.g.
+                      "val_0042_patient-P0012.png"
+        patient_id  : return every validation row belonging to that patient
+
+    Returns the matching row(s) as a DataFrame, including columns
+    image_file, patient_id, image_path, and coco_file (the annotated JSON
+    the ground-truth mask for that row was rasterised from).
+
+    Usage
+    -----
+        row = trace_patient_from_val_results(cfg.output_dir, image_id=42)
+        row = trace_patient_from_val_results(
+            cfg.output_dir, image_file="val_0042_patient-P0012.png"
+        )
+        rows = trace_patient_from_val_results(cfg.output_dir, patient_id="P0012")
+    """
+    results_csv = Path(output_dir) / "val_results.csv"
+    if not results_csv.exists():
+        raise FileNotFoundError(
+            f"No val_results.csv found at {results_csv}. Run train() first "
+            f"(it writes this file after the epoch loop)."
+        )
+    df = pd.read_csv(results_csv)
+
+    if image_id is not None:
+        return df[df["image_id"] == image_id]
+    if image_file is not None:
+        return df[df["image_file"] == image_file]
+    if patient_id is not None:
+        return df[df["patient_id"].astype(str) == str(patient_id)]
+    return df
 
 
 def update_merged_df_paths(smart_base_path, smartom_base_path, df):

@@ -34,6 +34,7 @@ CSV contract  (same as mask_rcnn_builder — no new columns needed)
 
 import json
 import logging
+import random
 from pathlib import Path
 from typing import Callable, Optional, Tuple
 
@@ -366,11 +367,31 @@ def _collate_fn(batch):
     return torch.stack(images), torch.stack(masks)
 
 
+def _normalize_patient_id(pid) -> str:
+    """
+    Collapse cosmetic differences in patient_id spelling (case, surrounding
+    whitespace) into one canonical key before grouping.
+
+    Why this matters: the merged CSV combines rows from several sources
+    (original SMART/SMART-OM rows + separately-generated augmented-data
+    CSVs). If the same physical patient is spelled e.g. "P0012" in one
+    source and "p0012 " (trailing space / different case) in another,
+    a naive `df["patient_id"].unique()` treats them as two different
+    patients. Both "patients" can then be independently assigned to
+    different splits — which is exactly how the same real patient ends up
+    with images in both train and val even though the split code itself
+    only ever assigns whole patients to one side.  Normalising first closes
+    that hole.
+    """
+    return str(pid).strip().lower()
+
+
 def build_data_loaders(
     logger: logging.Logger,
     csv_path: str,
     label_class_map: dict = LESION_CLASS_MAP,
     val_split: float = 0.2,
+    test_split: float = 0.0,
     batch_size: int = 4,
     num_workers: int = 2,
     seed: int = 42,
@@ -378,14 +399,28 @@ def build_data_loaders(
     target_size: Optional[Tuple[int, int]] = (512, 512),
     path_rewrite: Optional[dict] = None,
     encoder_name: str = "resnet50",
-) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader, int]:
+) -> Tuple[
+    torch.utils.data.DataLoader,
+    torch.utils.data.DataLoader,
+    Optional[torch.utils.data.DataLoader],
+    int,
+]:
     """
-    Read the metadata CSV and return (train_loader, val_loader, num_classes).
+    Read the metadata CSV and return (train_loader, val_loader, test_loader, num_classes).
 
     Uses the same CSV + coco_file column as Mask R-CNN — no mask_path needed.
     Masks are rasterised from COCO JSON polygons inside CocoSegDataset.__getitem__.
 
-    Patient-wise split: no patient appears in both train and val.
+    Patient-wise split: a patient's normalised id (see _normalize_patient_id)
+    is assigned to exactly ONE of train / val / test — the three id sets are
+    a strict partition of all patients, so no patient can appear in more than
+    one split. Set test_split=0.0 to keep the old train/val-only behaviour
+    (test_loader will be None).
+
+    Shuffling uses Python's built-in random.Random(seed).shuffle — a plain,
+    easy-to-audit shuffle rather than a torch Generator/randperm, since all
+    we need here is a reproducible ordering of patient ids, not a tensor op.
+
     Only rows with non-null coco_file where both image_path and coco_file
     exist on disk are included — same filter as build_data_loaders in
     mask_rcnn_builder.
@@ -422,33 +457,79 @@ def build_data_loaders(
             "No annotated images found on disk. Check csv_path and path_rewrite."
         )
 
-    # ── Patient-wise split (identical to mask_rcnn_builder) ───────────
+    # ── Patient-wise split: train / val / (optional) test, no overlap ──
     if "patient_id" not in df.columns:
         raise RuntimeError("Column 'patient_id' is required for patient-wise split.")
 
-    patient_ids = df["patient_id"].dropna().unique().tolist()
-    if len(patient_ids) < 2:
-        raise RuntimeError(
-            f"Need ≥2 unique patient_ids for split, got {len(patient_ids)}."
+    df["_patient_key"] = df["patient_id"].map(_normalize_patient_id)
+
+    n_raw = df["patient_id"].nunique()
+    n_norm = df["_patient_key"].nunique()
+    if n_norm < n_raw:
+        logger.warning(
+            "  %d raw patient_id spelling(s) merged into an existing patient "
+            "after normalisation (case/whitespace). These would previously "
+            "have been free to land in different splits — this is the "
+            "likely source of train/val patient overlap.",
+            n_raw - n_norm,
         )
 
-    g = torch.Generator().manual_seed(seed)
-    shuffled = [
-        patient_ids[i] for i in torch.randperm(len(patient_ids), generator=g).tolist()
-    ]
-    n_val = max(1, min(int(len(shuffled) * val_split), len(shuffled) - 1))
-    val_pids = set(shuffled[:n_val])
-    train_pids = set(shuffled[n_val:])
+    patient_ids = sorted(df["_patient_key"].dropna().unique().tolist())
+    min_patients_needed = 3 if test_split > 0 else 2
+    if len(patient_ids) < min_patients_needed:
+        raise RuntimeError(
+            f"Need ≥{min_patients_needed} unique patients for the requested "
+            f"split, got {len(patient_ids)}."
+        )
 
-    train_df = df[df["patient_id"].isin(train_pids)].reset_index(drop=True)
-    val_df = df[df["patient_id"].isin(val_pids)].reset_index(drop=True)
+    # ── Simple shuffler ─────────────────────────────────────────────────
+    # A plain, deterministic Python shuffle of the patient-id list. Sorting
+    # first makes the input order deterministic regardless of how pandas
+    # returned the unique values, so the same seed always reproduces the
+    # same split.
+    rng = random.Random(seed)
+    rng.shuffle(patient_ids)
+
+    n_total = len(patient_ids)
+    n_val = max(1, round(n_total * val_split))
+    n_test = max(1, round(n_total * test_split)) if test_split > 0 else 0
+
+    if n_val + n_test >= n_total:
+        raise RuntimeError(
+            f"val_split ({val_split}) + test_split ({test_split}) leave no "
+            f"patients for training out of {n_total} total patients. "
+            f"Lower val_split/test_split or add more patients."
+        )
+
+    val_pids = set(patient_ids[:n_val])
+    test_pids = set(patient_ids[n_val : n_val + n_test])
+    train_pids = set(patient_ids[n_val + n_test :])
+
+    # Sanity check: the three id sets must be a strict partition. This is
+    # guaranteed by construction above, but we assert it explicitly so any
+    # future edit to this function that breaks the invariant fails loudly
+    # instead of silently leaking patients across splits.
+    assert train_pids.isdisjoint(val_pids), "train/val patient overlap detected"
+    assert train_pids.isdisjoint(test_pids), "train/test patient overlap detected"
+    assert val_pids.isdisjoint(test_pids), "val/test patient overlap detected"
+
+    train_df = df[df["_patient_key"].isin(train_pids)].reset_index(drop=True)
+    val_df = df[df["_patient_key"].isin(val_pids)].reset_index(drop=True)
+    test_df = (
+        df[df["_patient_key"].isin(test_pids)].reset_index(drop=True)
+        if test_pids
+        else df.iloc[0:0].copy()
+    )
 
     logger.info(
-        "  Patient split → train_patients=%d (%d rows)  val_patients=%d (%d rows)",
+        "  Patient split → train=%d patients (%d rows)  val=%d patients (%d rows)"
+        "  test=%d patients (%d rows)",
         len(train_pids),
         len(train_df),
         len(val_pids),
         len(val_df),
+        len(test_pids),
+        len(test_df),
     )
 
     preprocessing_fn = get_preprocessing_fn(encoder_name)
@@ -486,13 +567,31 @@ def build_data_loaders(
         pin_memory=torch.cuda.is_available(),
     )
 
+    test_loader = None
+    if len(test_df) > 0:
+        test_ds = CocoSegDataset(
+            rows=test_df,
+            label_class_map=label_class_map,
+            preprocessing_fn=preprocessing_fn,
+            min_area=min_area,
+            target_size=target_size,
+        )
+        test_loader = torch.utils.data.DataLoader(
+            test_ds,
+            batch_size=1,
+            shuffle=False,
+            num_workers=num_workers,
+            collate_fn=_collate_fn,
+            pin_memory=torch.cuda.is_available(),
+        )
+
     num_classes = NUM_LESION_CLASSES
     logger.info(
         "  DataLoaders ready — num_classes=%d  encoder=%s",
         num_classes,
         encoder_name,
     )
-    return train_loader, val_loader, num_classes
+    return train_loader, val_loader, test_loader, num_classes
 
 
 # ══════════════════════════════════════════════════════════════════════════════
