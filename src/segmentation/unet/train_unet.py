@@ -533,6 +533,7 @@ def train(logger: logging.Logger, cfg: UNetConfig, csv_path: str) -> None:
         num_workers=cfg.num_workers,
         seed=cfg.seed,
         min_area=cfg.min_area,
+        encoder_name=cfg.backbone,
     )
 
     # ── Model ─────────────────────────────────────────────────────────
