@@ -27,6 +27,15 @@ class CustomSizeDayRotatingFileHandler(TimedRotatingFileHandler):
         utc=False,
         atTime=None,
     ):
+        # A fresh checkout/session may not have a 'logs' folder yet (log
+        # output is typically .gitignore'd). FileHandler.__init__ below does
+        # a plain open(filename, mode), which never creates missing parent
+        # directories on its own — so create it here rather than relying on
+        # every caller to have created it beforehand.
+        log_dir = os.path.dirname(filename)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+
         super().__init__(
             filename=filename,
             when=when,
